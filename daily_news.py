@@ -21,6 +21,7 @@ Required environment variables (set as GitHub Actions secrets):
 import os
 import sys
 import json
+import time
 import datetime
 from html import unescape
 import re
@@ -29,7 +30,21 @@ import xml.etree.ElementTree as ET
 import requests
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DailyNewsBot/1.0)"}
-GEMINI_MODEL = "gemini-2.5-flash"  # free tier: ~250 requests/day, plenty for 1x/day
+# Gemini's free-tier lineup and the "gemini-flash-latest" alias both drift
+# over time — models get deprecated, and the alias can get repointed to a
+# model version with different request requirements (seen in practice: a
+# working request started returning 400 INVALID_ARGUMENT after Google
+# rotated what the alias points to). Rather than pin one name and have the
+# whole script break on the next rotation, try several candidates in order
+# and use whichever one actually accepts the request.
+CANDIDATE_MODELS = [
+    "gemini-flash-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
 
 # ---- Configuration -----------------------------------------------------
 
@@ -99,8 +114,84 @@ def fetch_headlines() -> str:
     return "\n\n".join(blocks)
 
 
+def _call_gemini(model: str, prompt: str):
+    """
+    Call one Gemini model. Returns a parsed dict on success, or None if this
+    model couldn't produce a usable response (bad request it doesn't accept,
+    or output that wasn't valid JSON) — callers should try the next
+    candidate model in that case rather than giving up entirely.
+    """
+    max_attempts = 3
+    resp = None
+    for attempt in range(1, max_attempts + 1):
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            params={"key": os.environ["GEMINI_API_KEY"].strip()},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                # 8000 and 16000 (alone, with no other generationConfig
+                # fields) are both confirmed to work. Raising further to fit
+                # richer content — keeping the config otherwise minimal,
+                # since adding responseMimeType/thinkingConfig alongside
+                # maxOutputTokens is what previously triggered 400 errors.
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 24000},
+            },
+            timeout=120,
+        )
+        # 429 (rate limited) and 503 (temporarily overloaded) are transient —
+        # retry the SAME model with backoff instead of moving on immediately.
+        if resp.status_code in (429, 503) and attempt < max_attempts:
+            wait = 10 * attempt
+            print(
+                f"WARN: {model} returned {resp.status_code} (attempt {attempt}/{max_attempts}), "
+                f"retrying in {wait}s: {resp.text}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+        break
+
+    if resp.status_code == 400:
+        # Model-specific incompatibility (e.g. this alias currently points to
+        # a model version that rejects our request shape). Not worth retrying
+        # this model — signal the caller to move on to the next candidate.
+        print(f"WARN: {model} returned 400, trying next candidate model: {resp.text}", file=sys.stderr)
+        return None
+    if resp.status_code >= 300:
+        print(f"ERROR calling {model}: {resp.status_code} {resp.text}", file=sys.stderr)
+        resp.raise_for_status()
+
+    data = resp.json()
+    candidate = data["candidates"][0]
+    finish_reason = candidate.get("finishReason")
+    if finish_reason and finish_reason not in ("STOP", "MAX_TOKENS"):
+        print(f"WARN: {model} unexpected finishReason={finish_reason}: {data}", file=sys.stderr)
+    if finish_reason == "MAX_TOKENS":
+        print(f"WARN: {model} response was cut off (finishReason=MAX_TOKENS).", file=sys.stderr)
+
+    raw_text = candidate["content"]["parts"][0]["text"].strip()
+    # Strip accidental markdown code fences if the model adds them anyway.
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+        raw_text = re.sub(r"\s*```$", "", raw_text)
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        print(f"WARN: {model} output was not valid JSON ({e}), trying next candidate model.", file=sys.stderr)
+        print(f"Raw output length: {len(raw_text)} chars; last 300 chars: ...{raw_text[-300:]}", file=sys.stderr)
+        return None
+
+
 def build_digest(headlines_blob: str) -> dict:
-    """Ask Gemini (free tier) to turn raw headlines into the bilingual digest + vocab list."""
+    """Ask Gemini (free tier) to turn raw headlines into the bilingual digest + vocab list.
+
+    Tries a list of candidate models in order and uses whichever one actually
+    works. Gemini's free-tier model lineup and the "gemini-flash-latest" alias
+    both change over time (models get deprecated, aliases get repointed to
+    models with different request requirements), so hardcoding a single model
+    name is fragile. This fallback chain absorbs that churn.
+    """
     today = datetime.date.today().strftime("%Y/%m/%d")
     today_zh = datetime.date.today().strftime("%Y年%m月%d日")
 
@@ -109,12 +200,12 @@ briefing email from today's raw headlines below. Output ONLY a single JSON objec
 (no markdown fences, no commentary) with exactly these keys: "subject", "html", "text".
 
 Requirements for the content:
-- Pick the most important 4-6 INTERNATIONAL news stories and 4-6 FINANCIAL/MARKETS
+- Pick the most important 7-8 INTERNATIONAL news stories and 7-8 FINANCIAL/MARKETS
   news stories from the raw headlines provided. Skip duplicates, gossip, or trivial items.
 - For each story: first write a short, natural English sentence or two (like a wire
   service would phrase it), then immediately below it a Traditional Chinese (繁體中文)
   translation/summary, then the source name in parentheses.
-- After both sections, add a "📚 Today's Vocabulary 今日單字學習" section: pick 8-12
+- After both sections, add a "📚 Today's Vocabulary 今日單字學習" section: pick 15-20
   useful English words/phrases that actually appear in the English sentences you wrote
   above (prefer business/finance/news vocabulary a Chinese-speaking learner might not
   know, e.g. "tariff," "hawkish," "volatility," "ceasefire," "antitrust"). For each,
@@ -122,49 +213,55 @@ Requirements for the content:
   and the exact sentence from the briefing where it appears (bold the word/phrase
   within the sentence). Present this as an HTML table in the html version, and as a
   simple list in the text version.
+- Be reasonably concise in the HTML markup itself (inline styles, no long comments,
+  no unnecessary nesting) so more of the token budget goes to actual content rather
+  than markup overhead.
 - Title: "📰 Daily Global & Financial News Briefing 每日國際與金融新聞摘要 — {today_zh}"
 - subject should be: "📰 Daily News & Vocabulary 每日國際金融新聞與單字 — {today}"
 - "html" must be a complete, self-contained HTML email body (inline styles, no
   external CSS/JS), with clear section headers and a horizontal rule between the
-  three sections.
+  three sections. Keep the HTML compact — no long comments, no unnecessary nesting.
 - "text" must be an equivalent plain-text version (no HTML tags), for the plain-text
   fallback part of the email.
-- Keep the whole thing readable in about 5-7 minutes. Be factual, no speculation.
+- Keep the whole thing readable in about 6-8 minutes. Be factual, no speculation.
 
 Raw headlines (source, title, short summary, link):
 
 {headlines_blob}
 """
 
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        params={"key": os.environ["GEMINI_API_KEY"]},
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8000},
-        },
-        timeout=90,
+    errors = []
+    for model in CANDIDATE_MODELS:
+        try:
+            result = _call_gemini(model, prompt)
+        except Exception as e:
+            print(f"WARN: {model} raised {type(e).__name__}: {e}", file=sys.stderr)
+            errors.append(f"{model}: {e}")
+            continue
+        if result is not None:
+            print(f"INFO: digest generated successfully using model '{model}'")
+            return result
+        errors.append(f"{model}: returned no usable result (see warnings above)")
+
+    raise RuntimeError(
+        "All candidate Gemini models failed to produce a usable digest:\n"
+        + "\n".join(errors)
     )
-    if resp.status_code >= 300:
-        print(f"ERROR calling Gemini: {resp.status_code} {resp.text}", file=sys.stderr)
-        resp.raise_for_status()
-    data = resp.json()
-    raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    # Strip accidental markdown code fences if the model adds them anyway.
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-        raw_text = re.sub(r"\s*```$", "", raw_text)
-    return json.loads(raw_text)
 
 
 def send_email(subject: str, html: str, text: str):
-    to_email = os.environ["TO_EMAIL"]
-    from_email = os.environ.get("FROM_EMAIL", "每日新聞摘要 <onboarding@resend.dev>")
+    # .strip() defensively: GitHub secrets pasted from a browser/clipboard
+    # can end up with a trailing newline or leading/trailing whitespace,
+    # which `requests` rejects outright when the value goes into a header
+    # ("Invalid leading whitespace, reserved character(s), or return
+    # character(s) in header value").
+    to_email = os.environ["TO_EMAIL"].strip()
+    from_email = os.environ.get("FROM_EMAIL", "每日新聞摘要 <onboarding@resend.dev>").strip()
+    resend_api_key = os.environ["RESEND_API_KEY"].strip()
     resp = requests.post(
         "https://api.resend.com/emails",
         headers={
-            "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
+            "Authorization": f"Bearer {resend_api_key}",
             "Content-Type": "application/json",
         },
         json={
